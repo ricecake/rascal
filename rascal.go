@@ -6,6 +6,7 @@ import (
 	"github.com/streadway/amqp"
 	"log"
 	"os"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -13,10 +14,12 @@ import (
 type Rascal struct {
 	name       string
 	connection *amqp.Connection
-	handler    func(amqp.Delivery)
+	handlers   map[string]func(amqp.Delivery, *amqp.Channel)
 	errChan    chan *amqp.Error
 	active     bool
 	connLock   sync.Mutex
+	Custom     string
+	Default    string
 }
 
 func (this *Rascal) Connect() error {
@@ -84,12 +87,13 @@ func (this *Rascal) Connect() error {
 	queueName := fmt.Sprintf("%s-%s-%d", viper.GetString("app.name"), hostname, pid)
 	this.name = queueName
 
-	ch, chanErr := this.connection.Channel()
+	ch, chanErr := this.Channel()
 	if chanErr != nil {
 		return chanErr
 	}
 
 	if viper.IsSet("amqp.exchanges") {
+		log.Println("declaring exchanges")
 		exchanges := viper.Get("amqp.exchanges").([]interface{})
 		for _, exchangeData := range exchanges {
 			exchange := make(map[string]interface{})
@@ -114,49 +118,57 @@ func (this *Rascal) Connect() error {
 		}
 	}
 
-	if viper.IsSet("amqp.queues") {
-		queues := viper.Get("amqp.queues").([]interface{})
-		for _, queueData := range queues {
-			queue := make(map[string]interface{})
+	this.handlers = make(map[string]func(amqp.Delivery, *amqp.Channel))
 
-			for key, val := range queueData.(map[interface{}]interface{}) {
-				queue[key.(string)] = val
-			}
+	if viper.GetBool("amqp.queue.auto-queue") {
+		defaultQueue, qErr := ch.QueueDeclare(
+			this.name,
+			false,
+			true,
+			false,
+			false,
+			nil,
+		)
+		if qErr != nil {
+			log.Printf("Error declaring auto-queue: %s", qErr.Error())
+		}
+		this.Default = defaultQueue.Name
+	}
+	if viper.IsSet("amqp.queue") {
+		log.Println("declaring queue")
+		queue, queueErr := ch.QueueDeclare(
+			viper.GetString("amqp.queue.name"),    // name
+			viper.GetBool("amqp.queue.durable"),   // durable
+			viper.GetBool("amqp.queue.transient"), // auto-delete
+			viper.GetBool("amqp.queue.exclusive"), // exclusive
+			false, // no-wait
+			nil,   // arguments
+		)
+		if queueErr != nil {
+			log.Printf("error declaring queue: %s", queueErr.Error())
+			return queueErr
+		}
+		viper.Set("amqp.queue.name", queue.Name)
+		this.Custom = queue.Name
+	}
+	if viper.IsSet("amqp.queue.bindings") {
+		log.Println("declaring bindings...")
+		bindData := viper.GetStringMap("amqp.queue.bindings")
+		for exchange, bindings := range bindData {
 
-			_, queueErr := ch.QueueDeclare(
-				queue["name"].(string),    // name
-				queue["durable"].(bool),   // durable
-				queue["transient"].(bool), // auto-delete
-				queue["exclusive"].(bool), // exclusive
-				false, // no-wait
-				nil,   // arguments
-			)
-			if queueErr != nil {
-				log.Printf("error declaring queue: %s", queueErr.Error())
-				return queueErr
-			}
-			if binding, exists := queue["binding"]; exists {
-				for _, bindData := range binding.([]interface{}) {
-					bind := make(map[string]string)
-
-					for key, val := range bindData.(map[interface{}]interface{}) {
-						bind[key.(string)] = val.(string)
-					}
-
-					bindErr := ch.QueueBind(
-						queue["name"].(string), // queue name
-						bind["key"],            // routing key
-						bind["exchange"],       // exchange
-						false,
-						nil,
-					)
-					if bindErr != nil {
-						log.Printf("error binding queue to exhange: %s", bindErr.Error())
-						return bindErr
-					}
+			for _, binding := range bindings.([]interface{}) {
+				bindErr := ch.QueueBind(
+					viper.GetString("amqp.queue.name"), // queue name
+					binding.(string),                   // routing key
+					exchange,                           // exchange
+					false,
+					nil,
+				)
+				if bindErr != nil {
+					log.Printf("error binding queue to exhange: %s", bindErr.Error())
+					return bindErr
 				}
 			}
-
 		}
 	}
 
@@ -171,21 +183,26 @@ func (this *Rascal) Cleanup() {
 	return
 }
 
-func (this *Rascal) SetHandler(callback func(amqp.Delivery)) {
-	this.handler = callback
+func (this *Rascal) SetHandler(queueName string, callback func(amqp.Delivery, *amqp.Channel)) {
+	this.handlers[queueName] = callback
 	return
 }
 
+func (this *Rascal) Channel() (*amqp.Channel, error) {
+	log.Println("getting new channel...")
+	return this.connection.Channel()
+}
+
 func (this *Rascal) Consume() error {
-	process := func() error {
-		ch, chanErr := this.connection.Channel()
+	process := func(queueName string, handler func(amqp.Delivery, *amqp.Channel)) error {
+		ch, chanErr := this.Channel()
 		if chanErr != nil {
 			return chanErr
 		}
 		log.Printf("Worker channel successfully opened")
 
 		msgChannel, consumeErr := ch.Consume(
-			this.name, // queue
+			queueName, // queue
 			this.name, // amqp consumer tag
 			false,     // never auto ack here
 			false,
@@ -199,13 +216,17 @@ func (this *Rascal) Consume() error {
 		}
 
 		for msg := range msgChannel {
-			this.handler(msg)
+			handler(msg, ch)
 		}
 		log.Println("Worker Closing")
 		return nil
 	}
-	for i := 0; i < viper.GetInt("general.workthreads"); i++ {
-		go process()
+
+	viper.SetDefault("general.workthreads", runtime.NumCPU())
+	for queue, handler := range this.handlers {
+		for i := 0; i < viper.GetInt("general.workthreads"); i++ {
+			go process(queue, handler)
+		}
 	}
 	this.active = true
 	return nil
