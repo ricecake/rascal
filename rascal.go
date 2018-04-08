@@ -120,7 +120,7 @@ func (this *Rascal) Connect() error {
 
 	this.handlers = make(map[string]func(amqp.Delivery, *amqp.Channel))
 
-	if viper.GetBool("amqp.queue.auto-queue") {
+	if viper.GetBool("amqp.auto-queue") {
 		defaultQueue, qErr := ch.QueueDeclare(
 			this.name,
 			false,
