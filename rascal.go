@@ -133,6 +133,22 @@ func (this *Rascal) Connect() error {
 			log.Printf("Error declaring auto-queue: %s", qErr.Error())
 		}
 		this.Default = defaultQueue.Name
+
+		if viper.IsSet("amqp.auto-queue-bind") {
+			bindEx := viper.GetString("amqp.auto-queue-bind")
+			bindErr := ch.QueueBind(
+				this.Default, // queue name
+				this.Default, // routing key
+				bindEx,       // exchange
+				false,
+				nil,
+			)
+			if bindErr != nil {
+				log.Printf("error binding default queue to exhange: %s", bindErr.Error())
+				return bindErr
+			}
+		}
+
 	}
 	if viper.IsSet("amqp.queue") {
 		log.Println("declaring queue")
